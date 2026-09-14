@@ -93,9 +93,11 @@ local State = {
 	sellInterval = 120,
 	moveMethod = "AUTO", -- AUTO cycles TP -> TWEEN -> WALK on failure
 	tpDead = false, -- latched when TP gets rubber-banded this session
+	stepDead = false, -- latched when STEP gets blocked this session
 	tweenDead = false, -- latched when tween gets eaten too (walk-only)
 	walkOnly = false, -- latched: server locked all artificial movement
 	lastMove = "-",
+	stepSpeed = 120, -- studs/s for STEP bypass
 	safeMode = true, -- ON: farm never flies, TP only short hops, walk capped
 	maxTpHop = 50, -- TP allowed only under this distance in safe mode
 	safeWalkCap = 50, -- walk speed cap in safe mode
@@ -238,6 +240,89 @@ local function tweenTo(pos, speed)
 	return h2 and (h2.Position - pos).Magnitude <= 12 or false
 end
 
+-- STEP (tween bypass): small CFrame steps with noclip, flown UP -> OVER
+-- -> DOWN. No anchoring, no single big jump: the server sees continuous
+-- fast movement, and cruising above everything avoids kill volumes/void
+-- that straight lines cross (that is what kills you, not the speed).
+local function stepTo(pos, speed)
+	local hrp = myHRP()
+	if not hrp then return false end
+	local spd = speed or State.stepSpeed
+	local char = myCharacter()
+	local function ghost(on)
+		local c = char or myCharacter()
+		if not c then return end
+		for _, p in ipairs(c:GetDescendants()) do
+			if p:IsA("BasePart") then
+				if on then
+					pcall(function() p.CanCollide = false end)
+				elseif not State.noclip and p.Name ~= "HumanoidRootPart" then
+					pcall(function() p.CanCollide = true end)
+				end
+			end
+		end
+	end
+	ghost(true)
+	local function steppedGoto(dest, timeout)
+		local t0 = os.clock()
+		local h0 = myHRP()
+		local lastPos, lastMove, stuck = h0 and h0.Position or dest, os.clock(), 0
+		local tick = 0
+		while os.clock() - t0 < timeout do
+			if not State.running then return false end
+			local h = myHRP()
+			if not h then return false end
+			tick = tick + 1
+			if tick % 10 == 0 then ghost(true) end -- game restores collision
+			local to = dest - h.Position
+			local dist = to.Magnitude
+			if dist <= 6 then return true end
+			local step = to.Unit * math.min(spd * 0.05, dist)
+			pcall(function() h.CFrame = h.CFrame + step end)
+			if os.clock() - lastMove >= 1.5 then
+				if (h.Position - lastPos).Magnitude < 2 then
+					stuck = stuck + 1
+					pcall(function() h.CFrame = h.CFrame + Vector3.new(0, 18, 0) end)
+					if stuck >= 4 then return false end
+				else
+					stuck = 0
+				end
+				lastPos, lastMove = h.Position, os.clock()
+			end
+			task.wait(0.05)
+		end
+		local h2 = myHRP()
+		return h2 and (h2.Position - dest).Magnitude <= 12 or false
+	end
+	local start = hrp.Position
+	local startDist = (start - pos).Magnitude
+	if startDist <= 6 then ghost(false) return true end
+	-- UP -> short OVER legs -> DOWN. Two rules learned the hard way:
+	-- cruise above everything (straight lines cross kill volumes), and
+	-- never sustain artificial movement: legs of max 20m with a pause
+	-- between them, or the server kills you for impossible velocity.
+	local cruiseY = math.max(start.Y, pos.Y) + 45
+	if not steppedGoto(Vector3.new(start.X, cruiseY, start.Z), 12) then ghost(false) return false end
+	while true do
+		if not State.running then ghost(false) return false end
+		local h = myHRP()
+		if not h then ghost(false) return false end
+		local flat = Vector3.new(pos.X - h.Position.X, 0, pos.Z - h.Position.Z)
+		if flat.Magnitude <= 8 then break end
+		local leg = h.Position + flat.Unit * math.min(20, flat.Magnitude)
+		leg = Vector3.new(leg.X, cruiseY, leg.Z)
+		if not steppedGoto(leg, 10) then ghost(false) return false end
+		task.wait(0.3) -- let the velocity accumulator decay
+	end
+	local ok = steppedGoto(pos, 15)
+	ghost(false)
+	if not ok then
+		local h2 = myHRP()
+		ok = h2 and (h2.Position - pos).Magnitude <= 12 or false
+	end
+	return ok
+end
+
 -- Legit-looking walk with stuck detection (jump + fail).
 -- Safe mode caps speed: server knows your trained Speed stat.
 local function walkTo(pos, timeout)
@@ -281,10 +366,10 @@ local function walkTo(pos, timeout)
 	return h2 and (h2.Position - pos).Magnitude <= 12 or false
 end
 
--- Dispatcher: AUTO tries TP, falls back to TWEEN then WALK on detection.
+-- Dispatcher: AUTO tries TP, then STEP (tween bypass), then WALK.
 -- Safe mode: TP only for short hops (long jumps scream in server logs),
 -- farm never uses fly (BodyVelocity physics is the #1 ban flag).
--- Latches: tpDead/tweenDead persist per session; both dead = walk-only.
+-- Latches persist per session; TP+STEP dead = walk-only.
 local function moveTo(pos)
 	local hrp0 = myHRP()
 	local dist0 = hrp0 and (hrp0.Position - pos).Magnitude or math.huge
@@ -295,6 +380,9 @@ local function moveTo(pos)
 		methods = {}
 		if not State.tpDead and not (State.safeMode and dist0 > State.maxTpHop) then
 			methods[#methods + 1] = "TP"
+		end
+		if not State.stepDead then
+			methods[#methods + 1] = "STEP"
 		end
 		if not State.tweenDead then
 			methods[#methods + 1] = "TWEEN"
@@ -308,6 +396,8 @@ local function moveTo(pos)
 		local ok = false
 		if m == "TP" then
 			ok = tpTo(pos)
+		elseif m == "STEP" then
+			ok = stepTo(pos, State.stepSpeed)
 		elseif m == "TWEEN" then
 			ok = tweenTo(pos, State.tweenSpeed)
 		else
@@ -320,12 +410,15 @@ local function moveTo(pos)
 		if State.moveMethod == "AUTO" then
 			if m == "TP" and not State.tpDead then
 				State.tpDead = true
-				notify("URANIUM", "TP rubber-banded — TWEEN/WALK from now on", "alert")
+				notify("URANIUM", "TP rubber-banded — STEP/WALK from now on", "alert")
+			elseif m == "STEP" and not State.stepDead then
+				State.stepDead = true
+				notify("URANIUM", "Step blocked — TWEEN/WALK from now on", "alert")
 			elseif m == "TWEEN" and not State.tweenDead then
 				State.tweenDead = true
 				notify("URANIUM", "Tween eaten — WALK only from now on", "alert")
 			end
-			if State.tpDead and State.tweenDead and not State.walkOnly then
+			if State.tpDead and State.stepDead and State.tweenDead and not State.walkOnly then
 				State.walkOnly = true
 				notify("URANIUM", "Server locked movement: WALK-ONLY mode (slow but safe)", "alert")
 			end
@@ -558,6 +651,7 @@ end
 
 -- Plant: stand in my plot, equip an EGG tool (UID attribute, never gear
 -- like Trap/Bat), Activate (game plants it via its own tryPlace).
+-- Retries once from dead-center if the first Activate didn't consume it.
 local function plantCarried()
 	local center = plotCenter()
 	if not center then
@@ -566,26 +660,35 @@ local function plantCarried()
 	end
 	if not moveTo(center + Vector3.new(0, 4, 0)) then return false end
 	if not State.farm then return false end
-	local tools = listEggTools()
-	if #tools == 0 then
-		setStatus("FARM: no egg tool to plant")
-		return false
-	end
-	local hum = myHumanoid()
-	local char = myCharacter()
-	for i = #tools, 1, -1 do
-		if not State.farm then return false end
-		local tool = tools[i]
-		if tool and tool.Parent then
-			if hum and char and tool.Parent ~= char then
-				pcall(function() hum:EquipTool(tool) end)
-				task.wait(0.4)
+	for round = 1, 2 do
+		local tools = listEggTools()
+		if #tools == 0 then
+			setStatus("FARM: no egg tool to plant")
+			return round > 1
+		end
+		local hum = myHumanoid()
+		local char = myCharacter()
+		for i = #tools, 1, -1 do
+			if not State.farm then return false end
+			local tool = tools[i]
+			if tool and tool.Parent then
+				if hum and char and tool.Parent ~= char then
+					pcall(function() hum:EquipTool(tool) end)
+					task.wait(0.4)
+				end
+				pcall(function() tool:Activate() end)
+				task.wait(0.8)
+				if not tool.Parent or not inWorkspace(tool) then
+					return true -- planted (tool consumed)
+				end
 			end
-			pcall(function() tool:Activate() end)
-			task.wait(0.8)
-			if not tool.Parent or not inWorkspace(tool) then
-				return true -- planted (tool consumed)
-			end
+		end
+		if round == 1 and State.farm then
+			-- Re-center exactly and retry once (raycast may have missed).
+			setStatus("FARM: plant retry...")
+			local c2 = plotCenter()
+			if c2 then moveTo(c2 + Vector3.new(0, 4, 0)) end
+			task.wait(0.4)
 		end
 	end
 	return false
@@ -625,6 +728,12 @@ local function sellAllNow()
 end
 
 local function autoFarmLoop()
+	-- Noclip for the whole run (no wall snags mid-walk/step), restored after.
+	local prevNoclip = State.noclip
+	if not prevNoclip then
+		State.noclip = true
+		setToggle(UiRefs.noclipTgl, true)
+	end
 	while State.farm and State.running do
 		waitRespawn()
 		if not State.farm then break end
@@ -638,6 +747,7 @@ local function autoFarmLoop()
 			setStatus("FARM: egg " .. d .. "m (" .. (t.open and "OPEN" or "waiting") .. ")")
 			if not t.open then
 				-- Walk into range so the prompt wakes up, then re-check.
+				setStatus("FARM: approaching egg (" .. d .. "m)...")
 				moveTo(t.pos + Vector3.new(0, 3, 0))
 				task.wait(0.6)
 				if not State.farm then break end
@@ -645,10 +755,12 @@ local function autoFarmLoop()
 				if not t or not t.open then
 					task.wait(0.8)
 				else
+					setStatus("FARM: stealing...")
 					local ok = stealEgg(t)
 					setStatus(ok and "FARM: egg stolen!" or "FARM: steal failed")
 					if ok and State.autoPlant then
 						task.wait(0.3)
+						setStatus("FARM: going home to plant...")
 						if plantCarried() then
 							setStatus("FARM: planted!")
 							notify("URANIUM", "Egg planted", "check")
@@ -658,10 +770,12 @@ local function autoFarmLoop()
 					end
 				end
 			else
+				setStatus("FARM: stealing...")
 				local ok = stealEgg(t)
 				setStatus(ok and "FARM: egg stolen!" or "FARM: steal failed")
 				if ok and State.autoPlant then
 					task.wait(0.3)
+					setStatus("FARM: going home to plant...")
 					if plantCarried() then
 						setStatus("FARM: planted!")
 						notify("URANIUM", "Egg planted", "check")
@@ -672,6 +786,11 @@ local function autoFarmLoop()
 			end
 		end
 		task.wait(0.4)
+	end
+	if not prevNoclip then
+		State.noclip = false
+		setToggle(UiRefs.noclipTgl, false)
+		setNoclipParts(true)
 	end
 end
 
@@ -966,7 +1085,7 @@ local function setToggle(ref, v)
 	if ref then pcall(function() ref:Set(v) end) end
 end
 
-local MoveModes = { "AUTO", "TP", "TWEEN", "WALK" }
+local MoveModes = { "AUTO", "TP", "STEP", "TWEEN", "WALK" }
 
 local function buildGui()
 	local window = Zolar:Window({
@@ -986,6 +1105,7 @@ local function buildGui()
 			State.farm = v
 			if v then
 				State.tpDead = false
+				State.stepDead = false
 				State.tweenDead = false
 				State.walkOnly = false
 				if State.fly then
@@ -1041,6 +1161,10 @@ local function buildGui()
 	mSec:Slider({
 		Name = "Tween speed", Min = 40, Max = 400, Default = State.tweenSpeed, Suffix = "studs/s", Flag = "uraegg_tween",
 		Callback = function(v) State.tweenSpeed = v end,
+	})
+	mSec:Slider({
+		Name = "Step speed (tween bypass)", Min = 40, Max = 300, Default = State.stepSpeed, Suffix = "studs/s", Flag = "uraegg_step",
+		Callback = function(v) State.stepSpeed = v end,
 	})
 	mSec:Slider({
 		Name = "Walk speed", Min = 16, Max = 200, Default = State.walkSpeed, Suffix = "studs/s", Flag = "uraegg_walk",
