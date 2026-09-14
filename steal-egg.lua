@@ -6,7 +6,7 @@
 --  Standalone project. No other libraries required
 --  (besides Zolar Ui, loaded remotely below).
 --  Run:
---    loadstring(game:HttpGet("PUT_YOUR_RAW_URL_HERE/steal-egg.lua"))()
+--    loadstring(game:HttpGet("https://raw.githubusercontent.com/Korsac2026/steal-egg/main/steal-egg.lua"))()
 --
 --  Tabs:
 --    Farm     : Auto Farm (steal nearest egg, carry home, plant it),
